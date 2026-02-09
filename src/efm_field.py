@@ -6,14 +6,16 @@ import matplotlib.pyplot as plt
 import wandb
 import math
 import typing as tp
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from IPython.display import clear_output
 
 import sys
-sys.path.append("/trinity/home/a.kolesov/EFM/")
-from src.ode import get_rk45_sampler_pfgm, LearnedImageODESolver
+#sys.path.append("/trinity/home/a.kolesov/EFM/")
+sys.path.append("C:/Users/AsusPro/Desktop/MyFieldMatching/")
 
+from src.ode import get_rk45_sampler_efm, get_rk45_sampler_pfgm, LearnedImageODESolver
 
+import os
 
 class EFM:
     
@@ -226,13 +228,223 @@ class EFM:
         return net, losses
     ######################################## 
     
+    def train_old(self, train_loader, eval_loader, net, optimizer, optimize_fn,
+                    state, out_directopy_name = 'Sampling', alpha = 0, lims = None,  **kwargs: tp.Any):
+        
+        loss_train = []
+        loss_eval = []
+
+        train_iter = iter(train_loader)
+        eval_iter = iter(eval_loader)
+        
+        for step in tqdm(range(self._config.training.n_iters  + 1)):
+            
+            
+            ###############################
+            try:
+                batch_x,_ =  next(train_iter)
+            except StopIteration:
+                print('stop')
+            else:
+                train_iter = iter(train_loader)
+                batch_x,_ =  next(train_iter)
+            batch_x = batch_x.to(self._config.device)
+            #batch_y = torch.randn_like(batch_x).to(self._config.device)
+            batch_y = torch.randn_like(batch_x).to(self._config.device) * self._config.training.sigma_end
+            ###############################
+            
+            
+            optimizer = state['optimizer']
+            optimizer.zero_grad()
+            
+            
+            ###############################
+            perturbed_samples_vec = self.forward_interpolation(batch_x[:self._config.training.small_batch_size],
+                                                               batch_y[:self._config.training.small_batch_size])
+            
+            try:
+                assert torch.isnan(perturbed_samples_vec).any().item() == False
+            except AssertionError:
+                print('None values in perturbed samples between plates')
+            #else:
+            #    perturbed_samples_vec = self.forward_interpolation(batch_x[:self._config.training.small_batch_size],
+             #                                                  batch_y[:self._config.training.small_batch_size]) 
+            ###############################
+            
+            
+            
+            ###############################
+            field = self.GroundTruth(perturbed_samples_vec,
+                                     torch.cat([self._config.p.x_loc*torch.ones(len(batch_x))[:,None].to(self._config.device),
+                                                  batch_x.view(-1,self._config.DIM-1)], dim=1),
+                                     torch.cat([self._config.q.x_loc*torch.ones(len(batch_y))[:,None].to(self._config.device),
+                                                  batch_y.view(-1,self._config.DIM-1)], dim=1))
+            
+            try:
+                assert torch.isnan(perturbed_samples_vec).any().item() == False
+            except AssertionError:
+                print('None values in Ground Truth field')
+            #else:
+            #    field = self.GroundTruth(perturbed_samples_vec,
+            #                         torch.cat([self._config.p.x_loc*torch.ones(len(batch_x))[:,None].to(self._config.device),
+            #                                      batch_x.view(-1,self._config.DIM-1)], dim=1),
+            #                         torch.cat([self._config.q.x_loc*torch.ones(len(batch_y))[:,None].to(self._config.device),
+            #                                      batch_y.view(-1,self._config.DIM-1)], dim=1))
+            ###############################
+            
+            
+            #field = math.sqrt(self._config.DIM)*field/( torch.norm(field, dim=1, keepdim=True) + 1e-5)
+            
+            
+            perturbed_samples_x = perturbed_samples_vec[:, 1:].view(-1,self._config.data.num_channels,
+                                                                    self._config.data.image_size,
+                                                                    self._config.data.image_size)
+            perturbed_samples_z = perturbed_samples_vec[:, 0]
+            net_x, net_z = net(perturbed_samples_x, perturbed_samples_z)
+            
+            
+            ###############################
+            try:
+                assert torch.isnan(net_x).any().item() == False
+                assert torch.isnan(net_z).any().item() == False
+            except AssertionError:
+                print('None values in network prediction')
+            #else:
+            #    net_x, net_z = net(perturbed_samples_x, perturbed_samples_z)
+            ###############################   
+            if torch.isnan(net_x).any().item() == False and torch.isnan(net_z).any().item() == False and lims is not None:
+                net_x[torch.isnan(net_x)] = lims
+                net_z[torch.isnan(net_z)] = lims
+                
+            net_x = net_x.view(net_x.shape[0], -1)
+            # Predicted N+1-dimensional Poisson field
+            pred = torch.cat([net_z[:, None], net_x], dim=1)
+             
+            loss = torch.mean((field - pred)**2)
+ 
+            loss.backward()
+            optimize_fn(optimizer, net , step=state['step'], config=self._config)
+            state['step'] += 1
+            state['ema'].update(net.parameters())
+            #wandb.log({"loss train":loss.item()},step=step)
+            loss_train.append(loss.item())
+            
+            
+            if step % self._config.training.eval_freq == 0:
+        
+                try:
+                    batch_x,_ =  next(eval_iter)
+                except StopIteration:
+                    print('stop')
+                else:
+                    eval_iter = iter(eval_loader)
+                    batch_x,_ =  next(eval_iter)
+                batch_x = batch_x.to(self._config.device) 
+                batch_y = torch.randn_like(batch_x).to(self._config.device)
+
+
+                with torch.no_grad():
+                    ema = state['ema']
+                    ema.store(net.parameters())
+                    ema.copy_to(net.parameters())
+                    
+                    perturbed_samples_vec = self.forward_interpolation(batch_x[:self._config.training.small_batch_size],
+                                                                       batch_y[:self._config.training.small_batch_size])
+            
+                    field = self.GroundTruth(perturbed_samples_vec,
+                                             torch.cat([self._config.p.x_loc*\
+                                                          torch.ones(len(batch_x))[:,None].to(self._config.device),
+                                                          batch_x.view(-1,self._config.DIM-1)], dim=1),
+                                             torch.cat([self._config.q.x_loc*\
+                                                          torch.ones(len(batch_y))[:,None].to(self._config.device),
+                                                          batch_y.view(-1,self._config.DIM-1)], dim=1))
+                    
+                    #field = field/( torch.norm(field, dim=1, keepdim=True) + 1e-5) 
+                    perturbed_samples_x = perturbed_samples_vec[:, 1:].view(-1,self._config.data.num_channels,
+                                                                    self._config.data.image_size,
+                                                                    self._config.data.image_size)
+                    perturbed_samples_z = perturbed_samples_vec[:, 0]
+                    net_x, net_z = net(perturbed_samples_x, perturbed_samples_z)
+                    if torch.isnan(net_x).any().item() == False and torch.isnan(net_z).any().item() == False and lims is not None:
+                        net_x[torch.isnan(net_x)] = lims
+                        net_z[torch.isnan(net_z)] = lims
+                    net_x = net_x.view(net_x.shape[0], -1)
+                    # Predicted N+1-dimensional Poisson field
+                    pred = torch.cat([net_z[:, None], net_x], dim=1)
+
+                    eval_loss = torch.mean((field - pred)**2)
+   
+                    ema.restore(net.parameters())
+                    #wandb.log({"loss eval":eval_loss.item()},step=step)
+                    loss_eval.append([eval_loss.item(), step])
+                    
+            
+            # sampling #
+            
+            if step % self._config.training.snapshot_freq == 0 and step > 0:
+                
+                with torch.no_grad():
+                    ema.store(net.parameters())
+                    ema.copy_to(net.parameters())
+
+                    shape = (25, self._config.data.num_channels,
+                                 self._config.data.image_size, self._config.data.image_size)
+
+                    batch_y = torch.randn(*shape)
+                    
+                    # first sampling procedure #
+                    sampling_fn = get_rk45_sampler_pfgm(y=batch_y , config=self._config,
+                                                       shape=shape,
+                                                       eps=self._config.training.epsilon,
+                                                       device=self._config.device)
+                    sample, n, traj = sampling_fn(net, batch_y)
+                    # first sampling procedure #
+                    
+                    sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                    batch_y = np.clip(batch_y.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                    fig_1 = self.plot(sample.reshape(5,5,32,32,3) )
+                    fig_2 = self.plot(batch_y.reshape(5,5,32,32,3) )
+                    fig_3 = self.plot_trajectory(traj)
+                    #wandb.log({"Generated Images RK45":fig_1},step=step)
+                    #wandb.log({"Init Images":fig_2},step=step)
+                    #wandb.log({"Trajectories RK45":fig_3},step=step)
+                    out_dir = os.path.join(out_directopy_name, f"step_{step}")
+                    os.makedirs(out_dir, exist_ok=True)
+                    fig_1.savefig(os.path.join(out_dir, f"generated_RK45_step_{step}.png"), bbox_inches="tight")
+                    fig_2.savefig(os.path.join(out_dir, f"init_RK45_step_{step}.png"), bbox_inches="tight")
+                    fig_3.savefig(os.path.join(out_dir, f"trajectories_RK45_step_{step}.png"), bbox_inches="tight")
+                    plt.close(fig_1)
+                    plt.close(fig_2)
+                    plt.close(fig_3)
+
+                    
+                    # second sampling procedure #
+                    ode_solver = LearnedImageODESolver(net , self._config)
+                    batch_y = torch.randn(*shape).to(self._config.device)
+                    sample, traj = ode_solver(torch.cat([(self._config.L)*torch.ones(batch_y.shape[0],
+                                                                                    device=batch_y.device)[:,None],
+                                                         batch_y.view(-1, self._config.DIM-1)],dim=1).to(self._config.device))
+                    # second sampling procedure #
+                    
+                    #sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                    #batch_y = np.clip(batch_y.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                     
+                    fig_1 = self.plota(sample[:,1:].reshape(5,5,3,32,32).detach().cpu() )
+                    #fig_3 = self.plot_trajectory(traj)
+                    #wandb.log({"Generated Images Euler":fig_1},step=step)
+                    fig_1.savefig(os.path.join(out_dir, f"generated_Euler_step_{step}.png"), bbox_inches="tight")
+                    plt.close(fig_1)
+                    #wandb.log({"Trajectories Euler":fig_3},step=step)
     
+        return net, state, loss_train, loss_eval
     
     #######################################
     def train(self, train_loader, eval_loader, net, optimizer, optimize_fn,
-                    state,  **kwargs: tp.Any):
+                    state, out_directopy_name = 'Sampling',alpha = 0, lims = None, **kwargs: tp.Any):
         
-       
+        loss_train = []
+        loss_eval = []
+
         train_iter = iter(train_loader)
         eval_iter = iter(eval_loader)
         
@@ -282,17 +494,13 @@ class EFM:
                 assert torch.isnan(perturbed_samples_vec).any().item() == False
             except AssertionError:
                 print('None values in Ground Truth field')
-            else:
-                field = self.GroundTruth(perturbed_samples_vec,
-                                     torch.cat([self._config.p.x_loc*torch.ones(len(batch_x))[:,None].to(self._config.device),
-                                                  batch_x.view(-1,self._config.DIM-1)], dim=1),
-                                     torch.cat([self._config.q.x_loc*torch.ones(len(batch_y))[:,None].to(self._config.device),
-                                                  batch_y.view(-1,self._config.DIM-1)], dim=1))
-            ###############################
-            
-            
-            #field = math.sqrt(self._config.DIM)*field/( torch.norm(field, dim=1, keepdim=True) + 1e-5)
-            
+            #else:
+            #    field = self.GroundTruth(perturbed_samples_vec,
+            #                         torch.cat([self._config.p.x_loc*torch.ones(len(batch_x))[:,None].to(self._config.device),
+            #                                      batch_x.view(-1,self._config.DIM-1)], dim=1),
+            #                         torch.cat([self._config.q.x_loc*torch.ones(len(batch_y))[:,None].to(self._config.device),
+            #                                      batch_y.view(-1,self._config.DIM-1)], dim=1))
+            ###############################            
             
             perturbed_samples_x = perturbed_samples_vec[:, 1:].view(-1,self._config.data.num_channels,
                                                                     self._config.data.image_size,
@@ -307,24 +515,38 @@ class EFM:
                 assert torch.isnan(net_z).any().item() == False
             except AssertionError:
                 print('None values in network prediction')
-            else:
-                net_x, net_z = net(perturbed_samples_x, perturbed_samples_z)
-            ###############################    
-                
-            net_x = net_x.view(net_x.shape[0], -1)
-            # Predicted N+1-dimensional Poisson field
-            pred = torch.cat([net_z[:, None], net_x], dim=1)
-             
-            loss = torch.mean((field - pred)**2)
+
+            if torch.isnan(net_x).any().item() == False and torch.isnan(net_z).any().item() == False and lims is not None:
+                net_x[torch.isnan(net_x)] = lims
+                net_z[torch.isnan(net_z)] = lims
+
+            field_z = field[:, 0:1]                    # [B, 1] ground truth E_z (scalar per sample)
+            field_x = field[:, 1:]                     # [B, D]
+            net_x = net_x.view(field_x.shape)          # Ensure [B, D]
+
+            ratio = field_x / (field_z + 1e-6)          # [B, D]
+
+            loss1 = torch.mean((ratio - net_x)**2)
+
+            predicted_e_z = field_x / (net_x + 1e-6)   # [B, D]
+            predicted_e_z = predicted_e_z.mean(dim=1, keepdim=True)  # [B, 1]
+
+            if net_z.dim() == 1:
+                net_z = net_z.unsqueeze(1)
+
+            loss2 = torch.mean((predicted_e_z - net_z)**2)
+
+            loss = loss1 + alpha * loss2
  
             loss.backward()
             optimize_fn(optimizer, net , step=state['step'], config=self._config)
             state['step'] += 1
             state['ema'].update(net.parameters())
-            wandb.log({"loss train":loss.item()},step=step)
+            #wandb.log({"loss train":loss.item()},step=step)
+            loss_train.append(loss.item())
             
             
-            if step % self._config.training.eval_freq == 0:
+            if step % self._config.training.eval_freq == 0  and step > 0 and torch.isnan(net_x).any().item() == False and torch.isnan(net_z).any().item() == False:
         
                 try:
                     batch_x,_ =  next(eval_iter)
@@ -353,26 +575,43 @@ class EFM:
                                                           torch.ones(len(batch_y))[:,None].to(self._config.device),
                                                           batch_y.view(-1,self._config.DIM-1)], dim=1))
                     
-                    #field = field/( torch.norm(field, dim=1, keepdim=True) + 1e-5) 
                     perturbed_samples_x = perturbed_samples_vec[:, 1:].view(-1,self._config.data.num_channels,
                                                                     self._config.data.image_size,
                                                                     self._config.data.image_size)
                     perturbed_samples_z = perturbed_samples_vec[:, 0]
                     net_x, net_z = net(perturbed_samples_x, perturbed_samples_z)
+                    if torch.isnan(net_x).any().item() == False and torch.isnan(net_z).any().item() == False and lims is not None:
+                        net_x[torch.isnan(net_x)] = lims
+                        net_z[torch.isnan(net_z)] = lims
                     net_x = net_x.view(net_x.shape[0], -1)
-                    # Predicted N+1-dimensional Poisson field
-                    pred = torch.cat([net_z[:, None], net_x], dim=1)
 
-                    eval_loss = torch.mean((field - pred)**2)
-   
+                    field_z = field[:, 0:1]                    # [B, 1] ground truth E_z (scalar per sample)
+                    field_x = field[:, 1:]                     # [B, D]
+                    net_x = net_x.view(field_x.shape)          # Ensure [B, D]
+
+                    ratio = field_x / (field_z + 1e-6)          # [B, D]
+
+                    loss1 = torch.mean((ratio - net_x)**2)
+
+                    predicted_e_z = field_x / (net_x + 1e-6)   # [B, D]
+                    predicted_e_z = predicted_e_z.mean(dim=1, keepdim=True)  # [B, 1]
+
+                    if net_z.dim() == 1:
+                        net_z = net_z.unsqueeze(1)
+
+                    loss2 = torch.mean((predicted_e_z - net_z)**2)
+
+                    eval_loss = loss1 + alpha * loss2
+                    
                     ema.restore(net.parameters())
-                    wandb.log({"loss eval":eval_loss.item()},step=step)
+                    loss_eval.append([eval_loss.item(), step])
                     
             
             # sampling #
             
-            if step % self._config.training.snapshot_freq == 0:
+            if step % self._config.training.snapshot_freq == 0 and step > 0:
                 
+
                 with torch.no_grad():
                     ema.store(net.parameters())
                     ema.copy_to(net.parameters())
@@ -382,11 +621,11 @@ class EFM:
 
                     batch_y = torch.randn(*shape)
                     
-                    # first sampling procedure #
-                    sampling_fn = get_rk45_sampler_pfgm(y=batch_y , config=self._config,
+                    sampling_fn = get_rk45_sampler_efm(y=batch_y , config=self._config,
                                                        shape=shape,
                                                        eps=self._config.training.epsilon,
                                                        device=self._config.device)
+
                     sample, n, traj = sampling_fn(net, batch_y)
                     # first sampling procedure #
                     
@@ -395,9 +634,18 @@ class EFM:
                     fig_1 = self.plot(sample.reshape(5,5,32,32,3) )
                     fig_2 = self.plot(batch_y.reshape(5,5,32,32,3) )
                     fig_3 = self.plot_trajectory(traj)
-                    wandb.log({"Generated Images RK45":fig_1},step=step)
-                    wandb.log({"Init Images":fig_2},step=step)
-                    wandb.log({"Trajectories RK45":fig_3},step=step)
+                    #wandb.log({"Generated Images RK45":fig_1},step=step)
+                    #wandb.log({"Init Images":fig_2},step=step)
+                    #wandb.log({"Trajectories RK45":fig_3},step=step)
+
+                    out_dir = os.path.join(out_directopy_name, f"step_{step}")
+                    os.makedirs(out_dir, exist_ok=True)
+                    fig_1.savefig(os.path.join(out_dir, f"generated_RK45_step_{step}.png"), bbox_inches="tight")
+                    fig_2.savefig(os.path.join(out_dir, f"init_RK45_step_{step}.png"), bbox_inches="tight")
+                    fig_3.savefig(os.path.join(out_dir, f"trajectories_RK45_step_{step}.png"), bbox_inches="tight")
+                    plt.close(fig_1)
+                    plt.close(fig_2)
+                    plt.close(fig_3)
 
 
                     
@@ -407,17 +655,15 @@ class EFM:
                     sample, traj = ode_solver(torch.cat([(self._config.L)*torch.ones(batch_y.shape[0],
                                                                                     device=batch_y.device)[:,None],
                                                          batch_y.view(-1, self._config.DIM-1)],dim=1).to(self._config.device))
-                    # second sampling procedure #
-                    
-                    #sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
-                    #batch_y = np.clip(batch_y.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
-                     
+                    # second sampling procedure #                     
                     fig_1 = self.plota(sample[:,1:].reshape(5,5,3,32,32).detach().cpu() )
                     #fig_3 = self.plot_trajectory(traj)
-                    wandb.log({"Generated Images Euler":fig_1},step=step)
+                    #wandb.log({"Generated Images Euler":fig_1},step=step)
+                    fig_1.savefig(os.path.join(out_dir, f"generated_Euler_step_{step}.png"), bbox_inches="tight")
+                    plt.close(fig_1)
                     #wandb.log({"Trajectories Euler":fig_3},step=step)
     
-        return net, state
+        return net, state, loss_train, loss_eval
     #######################################
     
 
@@ -441,7 +687,6 @@ class EFM:
         """
         
         
-
         #################################################
         ######       Mesh Interpolation (Toy)      ######
         #################################################
@@ -513,9 +758,9 @@ class EFM:
                 m[idx] = torch.rand((num,), device=p_samples.device) * restrict_m
             """
             if self._config.training.restrict_M:
-                idx = (z < 0.005).squeeze()
+                idx = (z < 0.02).squeeze() #was 0.005
                 num = int(idx.int().sum())
-                restrict_m = int(self._config.training.M * 0.7)
+                restrict_m = int(self._config.training.M * 0.9) #was 0.7
                 m[idx] = torch.rand((num,), device=p_samples.device) * restrict_m
             
  
@@ -573,15 +818,16 @@ class EFM:
                 m[idx] = torch.rand((num,), device=p_samples.device) * restrict_m
             """
             if self._config.training.restrict_M:
-                idx = (z < 0.005).squeeze()
+                idx = (z < 0.02).squeeze()
                 num = int(idx.int().sum())
-                restrict_m = int(self._config.training.M * 0.7)
+                restrict_m = int(self._config.training.M * 0.9)
                 m[idx] = torch.rand((num,), device=p_samples.device) * restrict_m
             
  
             multiplier = (1+tau) ** m # torch.Size([b]) : the essence of this form??
             perturbed_z = z.squeeze() * multiplier # torch.Size([b])* torch.Size([b]) = torch.Size([b])
-            
+            #----------------i added clamp here--------------------------
+            # perturbed_z = torch.clamp(perturbed_z, self._config.training.epsilon, self._config.L - self._config.training.epsilon)
             
             perturbed_x = q_samples*(perturbed_z[:,None,None,None]/self._config.L) + (1 - perturbed_z[:,None,None,None]/self._config.L)*p_samples
             perturbed_samples_vec = torch.cat([perturbed_z[:, None],

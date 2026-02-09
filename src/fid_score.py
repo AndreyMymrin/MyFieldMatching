@@ -44,7 +44,7 @@ from torch.nn.functional import adaptive_avg_pool2d
 from PIL import Image
 
 try:
-    from tqdm import tqdm
+    from tqdm.auto import tqdm
 except ImportError:
     # If not tqdm is not available, provide a mock version of it
     def tqdm(x): return x

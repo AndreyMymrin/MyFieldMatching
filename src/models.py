@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset, Subset
 import numpy as np
 
 from typing import Optional, Union, Callable
-from tqdm.auto import trange
+from tqdm import trange
 import os
 import math
 import functools

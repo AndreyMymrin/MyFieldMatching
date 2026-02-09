@@ -7,7 +7,7 @@ import typing as tp
 
 from scipy import integrate, linalg
 import sys
-sys.path.append("/trinity/home/a.kolesov/EFM/")
+sys.path.append("C:/Users/AsusPro/Desktop/MyFieldMatching/")
 from src.utils import from_flattened_numpy,  to_flattened_numpy
 
 
@@ -167,15 +167,7 @@ def get_rk45_sampler_pfgm( y, config, shape,   rtol=1e-4, atol=1e-4,
         x = x.float()
         new_shape = (len(x), config.data.num_channels + 1, config.data.image_size, config.data.image_size)
         
-       
-         
-
-        
-
         def ode_func(t, x):
-
-           
-
 
             x = from_flattened_numpy(x, new_shape).to(device).type(torch.float32)
 
@@ -184,13 +176,12 @@ def get_rk45_sampler_pfgm( y, config, shape,   rtol=1e-4, atol=1e-4,
             #net_fn = get_predict_fn(sde, model, train=False)
 
             x_drift, z_drift = model(x[:, 1:], torch.ones((len(x))).to(device) * z)
+
             x_drift = x_drift.view(len(x_drift), -1)
 
             # Substitute the predicted z with the ground-truth
             # Please see Appendix B.2.3 in PFGM paper (https://arxiv.org/abs/2209.11178) for details
             z_exp = config.sampling.z_exp
-
- 
 
             if z < z_exp and config.training.gamma > 0:
                 data_dim = config.data.image_size * config.data.image_size * config.data.num_channels
@@ -200,7 +191,6 @@ def get_rk45_sampler_pfgm( y, config, shape,   rtol=1e-4, atol=1e-4,
                 x_norm = torch.sqrt(x_norm ** 2 + z ** 2)
                 z_drift = -sqrt_dim * torch.ones_like(z_drift) * z / (x_norm + config.training.gamma)
 
-                
                 
             # Predicted normalized Poisson field
             v = torch.cat([ z_drift[:, None], x_drift], dim=1)
@@ -213,18 +203,13 @@ def get_rk45_sampler_pfgm( y, config, shape,   rtol=1e-4, atol=1e-4,
             drift = torch.cat([torch.ones((len(dx_dz), 1, config.data.image_size,
                                            config.data.image_size)).to(dx_dz.device) * z, z * dx_dz], dim=1)
             return to_flattened_numpy(drift)
-
- 
-        
-        
-
         
         # Black-box ODE solver for the probability flow ODE.
         # Note that we use z = exp(t) for change-of-variable to accelearte the ODE simulation
         solution = integrate.solve_ivp(ode_func,
-                                       (np.log(config.L),
-                                                  np.log(config.training.epsilon)), to_flattened_numpy(x),
-                                     rtol=rtol, atol=atol, method=method)
+                                       (np.log(config.L), np.log(config.training.epsilon)),
+                                        to_flattened_numpy(x),
+                                        rtol=rtol, atol=atol, method=method)
 
         nfe = solution.nfev
         num_itrs = len(solution.y[0])
@@ -245,11 +230,118 @@ def get_rk45_sampler_pfgm( y, config, shape,   rtol=1e-4, atol=1e-4,
  
     return ode_sampler
 
+'''
+def get_rk45_sampler_efm(y, config, shape, rtol=1e-4, atol=1e-4,
+                         method='RK45', eps=1e-3, device='cuda'):
+    def ode_sampler(model, y):
+        batch_size = len(y)
+        x = y.view(shape)  # [B, C, H, W]
 
-############################
+        # Augment with z channel (starts at 0)
+        z_init = torch.zeros(batch_size, 1, config.data.image_size, config.data.image_size, device=x.device)
+        x_aug = torch.cat([z_init, x], dim=1).float()
+        new_shape = (batch_size, config.data.num_channels + 1, config.data.image_size, config.data.image_size)
 
-  
+        def ode_func(t, x_flat):
+            x = from_flattened_numpy(x_flat, new_shape).to(device).type(torch.float32)  # [B, 4, 32, 32]
+            current_z = float(t)
+
+            x_data = x[:, 1:, :, :]  # [B, 3, 32, 32] — only RGB part
+
+            dx_dz_pred, _ = model(x_data, torch.full((batch_size,), current_z, device=device))
+            dx_dz_flat = dx_dz_pred.view(batch_size, -1).cpu() # [B, 3072]
+
+            dz_dt = torch.ones((batch_size, 1), dtype=torch.float32)
+
+            # Pad data drift to match 4 channels: [dz_dt, dx_dz_channel1, dx_dz_channel2, dx_dz_channel3]
+            drift = torch.concatenate([dz_dt, dx_dz_flat], axis=1)  # [B, 1 + 3072] = [B, 3073]
+
+            return to_flattened_numpy(drift)
+
+        solution = integrate.solve_ivp(
+            ode_func,
+            (0.0, float(config.L)),  # integrate z from 0 to L
+            to_flattened_numpy(x_aug),
+            rtol=rtol, atol=atol, method=method
+        )
+
+        nfe = solution.nfev
+        num_itrs = solution.y.shape[1]
+        x_final = torch.tensor(solution.y[:, -1], device=device)
+        x_final = from_flattened_numpy(x_final, new_shape)[:, 1:]
+
+        # Trajectory
+        trajectory = []
+        visual_iters = torch.linspace(max(num_itrs // 8, 1), num_itrs, 10, dtype=int)
+        for itr in visual_iters:
+            state = torch.tensor(solution.y[:, itr-1], device=device)
+            state = from_flattened_numpy(state, new_shape)
+            trajectory.append(state[:, 1:].detach().cpu())
+
+        return x_final, nfe, torch.stack(trajectory, dim=0)
+
+    return ode_sampler
+  '''
+def get_rk45_sampler_efm(y, config, shape, rtol=1e-4, atol=1e-4,
+                         method='RK45', eps=1e-3, device='cuda'):
+    """RK45 ODE sampler for s-EFM with direct dx/dz prediction.
     
+    This version does not augment the state with a z-channel, tracking z as the integration variable t instead.
+    This eliminates shape mismatches and simplifies the code.
+    """
+
+    def ode_sampler(model, y):
+        batch_size = len(y)
+        x = y.clone()  # [B, C*H*W flattened initially, but reshape]
+        x = x.view(shape)  # [B, C, H, W]
+
+        # Flattened shape for data only (no z augmentation)
+        flat_shape = (batch_size, config.data.num_channels * config.data.image_size * config.data.image_size)
+
+        def ode_func(t, x_flat):
+            # Reconstruct data from flattened state
+            x_reshaped = torch.from_numpy(x_flat.reshape(flat_shape)).float().to(device).view(shape)
+            current_z = float(t)  # t == z
+
+            # Model predicts dx/dz directly
+            dx_dz_pred, _ = model(x_reshaped, torch.full((batch_size,), current_z, device=device))
+
+            # Flatten prediction as drift (dx/dt = dx/dz since dt = dz)
+            drift_flat = dx_dz_pred.view(flat_shape).cpu().numpy()
+
+            return drift_flat.ravel()  # Return 1D flattened array for solve_ivp
+
+        # Initial flattened state (data only)
+        initial_flat = x.view(flat_shape).cpu().numpy().ravel()
+
+        # Integrate from z=0 to z=L
+        solution = integrate.solve_ivp(
+            ode_func,
+            (0.0, float(config.L)),
+            initial_flat,
+            rtol=rtol,
+            atol=atol,
+            method=method
+        )
+
+        nfe = solution.nfev
+        num_itrs = solution.y.shape[1]
+
+        # Final state
+        x_final = torch.from_numpy(solution.y[:, -1].reshape(flat_shape)).to(device).view(shape)
+
+        # Trajectory for visualization
+        trajectory = []
+        visual_iters = np.linspace(max(num_itrs // 8, 1), num_itrs, 10, dtype=int)
+
+        for itr in visual_iters:
+            traj_flat = solution.y[:, itr - 1].reshape(flat_shape)
+            traj = torch.from_numpy(traj_flat).to(device).view(shape).detach().cpu()
+            trajectory.append(traj)
+
+        return x_final, nfe, torch.stack(trajectory, dim=0)
+
+    return ode_sampler
 
     
 #############################
@@ -291,15 +383,6 @@ class LearnedImageODESolver:
             
         return x_init, trajectory
 #############################   
-    
-    
-    
-    
-    
-    
-    
-
-
 
 #############################
 
@@ -326,16 +409,6 @@ class BaseODESolver:
             
         return perturbed_samples_vec, trajectory
 #############################
-
-
-
-
-
-
-
-
-
-
 
 #############################
 class LearnedODESolver:

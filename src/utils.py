@@ -231,7 +231,7 @@ def optimization_manager(config):
             param_norm = p.grad.detach().data.norm(2)
             total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
-        wandb.log({"Gradient's norm before clip" : total_norm },step=step)
+        #wandb.log({"Gradient's norm before clip" : total_norm },step=step)
          
        
         if grad_clip > 0:
@@ -243,11 +243,11 @@ def optimization_manager(config):
             param_norm = p.grad.detach().data.norm(2)
             total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
-        wandb.log({"Gradient's norm after clip" : total_norm },step=step)
+        #wandb.log({"Gradient's norm after clip" : total_norm },step=step)
         
         
         optimizer.step()
-        wandb.log({"Learning rate" : optimizer.param_groups[0]['lr']},step=step)
+        #wandb.log({"Learning rate" : optimizer.param_groups[0]['lr']},step=step)
         #scheduler.step()
 
     return optimize_fn
